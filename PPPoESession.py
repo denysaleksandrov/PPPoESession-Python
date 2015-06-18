@@ -14,6 +14,7 @@ Host_Unique = '\x01\x03'
 AC_Cookie = '\x01\x04'
 LCP = 49185
 CHAP = 49699
+PAP  = 49187
 IPCP = 32801
 IPv4 = 33
 PADI = 9
@@ -29,6 +30,8 @@ TermReq = '\x05'
 TermAck = '\x06'
 EchoReq = '\x09'
 EchoRep = '\x0a'
+AuthReq = '\x01'
+AuthRep = '\x02'
 MTU = '\x01\x04'
 MAGIC = '\x05\x06'
 Challenge = '\x01'
@@ -41,6 +44,13 @@ lastpkt = IP()
 def word(value):
 # Generates a two byte representation of the provided number
   return(chr((value/256)%256)+chr(value%256))
+
+def word_one_byte(value):
+  return chr(value%256)  
+
+def id_gen():
+    for i in xrange(1, 10000):
+        yield i
 
 def TLV(type, value):
 # Generates a TLV for a variable length string
@@ -82,6 +92,7 @@ class PPPoESession(Automaton):
   servicename = ""
   username = ""
   password = ""
+  authentication = ['pap']   # could be [pap], [chap], [chap, pap] which is equivalent to [both]
   chal_id = ""
   challenge = ""
   ipaddress = chr(0) + chr(0) + chr(0) + chr(0)
@@ -316,7 +327,7 @@ class PPPoESession(Automaton):
       raise self.LCP_OPEN()
 #
 # Transitions from LCP_OPEN
-  @ATMT.timeout(LCP_OPEN, 3)
+  @ATMT.timeout(LCP_OPEN, 4)
   def auth_or_ipcp_timeout(self):
     print "Timed out waiting for authentication challenge or IPCP from peer"
     self.retries -= 1
@@ -324,16 +335,39 @@ class PPPoESession(Automaton):
       print "Too many retries, aborting."
       raise self.ERROR()
     raise self.LCP_OPEN()
+
   @ATMT.receive_condition(LCP_OPEN, prio=1)
   def get_challenge(self,pkt):
   # We received a CHAP challenge from the peer so we must authenticate ourself.
-    if (PPP in pkt) and pkt[PPP].proto == CHAP and (pkt[Raw].load[0:1]==Challenge and pkt[Ether].src==self.ac_mac):
+    if (PPP in pkt) \
+        and pkt[PPP].proto == CHAP \
+        and (pkt[Raw].load[0:1]==Challenge \
+            and pkt[Ether].src==self.ac_mac) \
+        and ('chap' in self.authentication or 'both' in self.authentication):
       print "Got CHAP Challenge, Authenticating"
       self.chal_id = pkt[Raw].load[1:2]
       chal_len = ord(pkt[Raw].load[4:5])
       self.challenge = pkt[Raw].load[5:5+chal_len]
       raise self.AUTHENTICATING()
+                 
   @ATMT.receive_condition(LCP_OPEN, prio=2)
+  def pap_authentication(self, pkt):
+    if 'pap' in self.authentication or 'both' in self.authentication:   
+      idgen = id_gen()
+      id = idgen.next()
+      resp_len = word(len(self.username) + len(self.password)+5+id)
+      sendp(Ether(src=self.mac, dst=self.ac_mac)/PPPoE(sessionid=self.sess_id)/PPP(proto=PAP) \
+            /Raw(load=AuthReq 
+                 + word_one_byte(id)
+                 + resp_len
+                 + word_one_byte(len(self.username))
+                 + self.username
+                 + word_one_byte(len(self.password))
+                 + self.password),
+              iface=self.iface, verbose=False)
+      raise self.WAIT_AUTH_RESPONSE()
+
+  @ATMT.receive_condition(LCP_OPEN, prio=3)
   def lcp_open_get_IPCP(self,pkt):
   # Straight to IPCP if the peer doesn't challenge.
     if (PPP in pkt) and pkt[PPP].proto == IPCP and (pkt[Raw].load[0:1]==Challenge and pkt[Ether].src==self.ac_mac):
@@ -362,6 +396,10 @@ class PPPoESession(Automaton):
     if (PPP in pkt) and pkt[PPP].proto == CHAP and (pkt[Raw].load[0:1]==Success and pkt[Ether].src==self.ac_mac):
       print "Authenticated OK"
       raise self.START_IPCP()
+    elif (PPP in pkt) and pkt[PPP].proto == PAP and pkt[Raw].load[0:1]==AuthRep:
+      print "Authentication OK"
+      raise self.START_IPCP()
+        
   @ATMT.receive_condition(WAIT_AUTH_RESPONSE, prio=2)
   def wait_auth_response_rx_reject(self,pkt):
   # We received a CHAP reject and must terminate.
@@ -391,6 +429,7 @@ class PPPoESession(Automaton):
     raise self.IPCP_Request_Sent()
 #
 ## Transitions from IPCP_Request_Sent
+
   @ATMT.timeout(IPCP_Request_Sent, 3)
   def ipcp_req_sent_timeout(self):
   # We timed out. Re-send Configure-Request.
@@ -399,13 +438,13 @@ class PPPoESession(Automaton):
   @ATMT.receive_condition(IPCP_Request_Sent, prio=1)
   def ipcp_req_sent_rx_confack(self,pkt):
   # We received a ConfAck and can proceed with the current parameters.
-    if (PPP in pkt) and pkt[PPP].proto == IPCP and (pkt[PPP].do_build_payload()[0:1]==ConfAck and pkt[Ether].src==self.ac_mac):
+    if (PPP in pkt) and pkt[PPP].proto == IPCP and (pkt[PPP].build_payload()[0:1]==ConfAck and pkt[Ether].src==self.ac_mac):
       raise self.IPCP_Ack_Received()
   @ATMT.receive_condition(IPCP_Request_Sent, prio=2)
   def ipcp_req_sent_rx_confnak(self,pkt):
   # We received a ConfNak and must adjust the current parameters.
-    if (PPP in pkt) and pkt[PPP].proto == IPCP and (pkt[PPP].do_build_payload()[0:1]==ConfNak and pkt[Ether].src==self.ac_mac):
-      suggestion = pkt[PPP].do_build_payload()[6:10]
+    if (PPP in pkt) and pkt[PPP].proto == IPCP and (pkt[PPP].build_payload()[0:1]==ConfNak and pkt[Ether].src==self.ac_mac):
+      suggestion = pkt[PPP].build_payload()[6:10]
       print "Peer provided our IP as " + str(ord(suggestion[0:1])) + "." + str(ord(suggestion[1:2])) + "." + str(ord(suggestion[2:3])) + "." + str(ord(suggestion[3:4]))
       self.ipaddress = suggestion
       sendp(Ether(src=self.mac, dst=self.ac_mac)/PPPoE(sessionid=self.sess_id)/PPP(proto=IPCP)/Raw(load=confreq(Address+self.ipaddress)), iface=self.iface, verbose=False)
@@ -413,8 +452,8 @@ class PPPoESession(Automaton):
   @ATMT.receive_condition(IPCP_Request_Sent, prio=3)
   def ipcp_req_sent_rx_confreq(self,pkt):
   # We received a ConfReq and must validate our peer's proposed parameters.
-    if (PPP in pkt) and pkt[PPP].proto == IPCP and (pkt[PPP].do_build_payload()[0:1]==ConfReq and pkt[Ether].src==self.ac_mac):
-      payload = pkt[PPP].do_build_payload()
+    if (PPP in pkt) and pkt[PPP].proto == IPCP and (pkt[PPP].build_payload()[0:1]==ConfReq and pkt[Ether].src==self.ac_mac):
+      payload = pkt[PPP].build_payload()
       [gwip, otherstuff] = parseconfreq(payload)
       if(len(gwip) == 4 and otherstuff == ''):
         # If the other end just wants to negotiate its IP, we will take it.
@@ -445,8 +484,8 @@ class PPPoESession(Automaton):
   @ATMT.receive_condition(IPCP_Ack_Received)
   def ipcp_ack_recv_got_confreq(self,pkt):
   # We received a ConfReq and must validate our peer's proposed parameters.
-    if (PPP in pkt) and pkt[PPP].proto == IPCP and (pkt[PPP].do_build_payload()[0:1]==ConfReq and pkt[Ether].src==self.ac_mac):
-      payload = pkt[PPP].do_build_payload()
+    if (PPP in pkt) and pkt[PPP].proto == IPCP and (pkt[PPP].build_payload()[0:1]==ConfReq and pkt[Ether].src==self.ac_mac):
+      payload = pkt[PPP].build_payload()
       [gwip, otherstuff] = parseconfreq(payload)
       if(len(gwip) == 4 and otherstuff == ''):
         # If the other end just wants to negotiate its IP, we will take it.
@@ -472,14 +511,14 @@ class PPPoESession(Automaton):
   @ATMT.receive_condition(IPCP_Ack_Sent, prio=1)
   def ipcp_ack_sent_rx_confack(self,pkt):
   # We received a ConfAck and can proceed with the current parameters.
-    if (PPP in pkt) and pkt[PPP].proto == IPCP and (pkt[PPP].do_build_payload()[0:1]==ConfAck and pkt[Ether].src==self.ac_mac):
+    if (PPP in pkt) and pkt[PPP].proto == IPCP and (pkt[PPP].build_payload()[0:1]==ConfAck and pkt[Ether].src==self.ac_mac):
       print "IPCP Open."
       raise self.IPCP_OPEN()
   @ATMT.receive_condition(IPCP_Ack_Sent, prio=2)
   def ipcp_ack_sent_rx_confnak(self,pkt):
   # We received a ConfNak and must adjust the current parameters.
-    if (PPP in pkt) and pkt[PPP].proto == IPCP and (pkt[PPP].do_build_payload()[0:1]==ConfNak and pkt[Ether].src==self.ac_mac):
-      suggestion = pkt[PPP].do_build_payload()[6:10]
+    if (PPP in pkt) and pkt[PPP].proto == IPCP and (pkt[PPP].build_payload()[0:1]==ConfNak and pkt[Ether].src==self.ac_mac):
+      suggestion = pkt[PPP].build_payload()[6:10]
       print "Peer provided our IP as " + str(ord(suggestion[0:1])) + "." + str(ord(suggestion[1:2])) + "." + str(ord(suggestion[2:3])) + "." + str(ord(suggestion[3:4])) + "."
       self.ipaddress = suggestion
       sendp(Ether(src=self.mac, dst=self.ac_mac)/PPPoE(sessionid=self.sess_id)/PPP(proto=IPCP)/Raw(load=confreq(Address+self.ipaddress)), iface=self.iface, verbose=False)
@@ -487,8 +526,8 @@ class PPPoESession(Automaton):
   @ATMT.receive_condition(IPCP_Ack_Sent, prio=3)
   def ipcp_ack_sent_rx_confreq(self,pkt):
   # We received a ConfReq and must re-validate our peer's proposed parameters.
-    if (PPP in pkt) and pkt[PPP].proto == IPCP and (pkt[PPP].do_build_payload()[0:1]==ConfReq and pkt[Ether].src==self.ac_mac):
-      payload = pkt[PPP].do_build_payload()
+    if (PPP in pkt) and pkt[PPP].proto == IPCP and (pkt[PPP].build_payload()[0:1]==ConfReq and pkt[Ether].src==self.ac_mac):
+      payload = pkt[PPP].build_payload()
       [gwip, otherstuff] = parseconfreq(payload)
       if(len(gwip) == 4 and otherstuff == ''):
         # If the other end just wants to negotiate its IP, we will take it.
@@ -523,6 +562,3 @@ class PPPoESession(Automaton):
     if (PPPoED in pkt) and (pkt[PPPoED].code==PADT):
       print "Received PADT, shutting down."
       raise self.ERROR()
-
-
-
